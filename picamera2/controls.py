@@ -20,8 +20,7 @@ class Controls():
     def __init__(self, picam2, controls={}):
         self._picam2 = picam2
         self._controls = []
-        self._lock = threading.Lock()
-        self.set_controls(controls)
+        self._set_controls(controls)
 
     def __setattr__(self, name, value):
         if not name.startswith('_'):
@@ -45,41 +44,45 @@ class Controls():
         return f"<Controls: {self.make_dict()}>"
 
     def __enter__(self):
-        self._lock.acquire()
+        self._picam2.controls_lock.acquire()
         return self
 
     def __exit__(self, exc_type, exc_value, tb):
-        self._lock.release()
+        self._picam2.controls_lock.release()
 
     def set_controls(self, controls):
-        with self._lock:
-            if isinstance(controls, dict):
-                for k, v in controls.items():
-                    self.__setattr__(k, v)
-            elif isinstance(controls, Controls):
-                for k in controls._controls:
-                    v = controls.__dict__[k]
-                    self.__setattr__(k, v)
-            else:
-                raise RuntimeError(f"Cannot update controls with {type(controls)} type")
+        # Can be called safely by users.
+        with self._picam2.controls_lock:
+            self._set_controls(controls)
+
+    def _set_controls(self, controls):
+        # The caller must hold the picam2.controls_lock
+        if isinstance(controls, dict):
+            for k, v in controls.items():
+                self.__setattr__(k, v)
+        elif isinstance(controls, Controls):
+            for k in controls._controls:
+                v = controls.__dict__[k]
+                self.__setattr__(k, v)
+        else:
+            raise RuntimeError(f"Cannot update controls with {type(controls)} type")
 
     def get_libcamera_controls(self):
+        # The caller must hold the picam2.controls_lock
         libcamera_controls = {}
-        with self._lock:
-            for k in self._controls:
-                v = self.__dict__[k]
-                id = self._picam2.camera_ctrl_info[k][0]
-                if id.type == ControlType.Rectangle:
-                    v = Rectangle(*v)
-                elif id.type == ControlType.Size:
-                    v = Size(*v)
-                libcamera_controls[id] = v
+        for k in self._controls:
+            v = self.__dict__[k]
+            id = self._picam2.camera_ctrl_info[k][0]
+            if id.type == ControlType.Rectangle:
+                v = Rectangle(*v)
+            elif id.type == ControlType.Size:
+                v = Size(*v)
+            libcamera_controls[id] = v
         return libcamera_controls
 
     def make_dict(self):
         dict_ = {}
-        with self._lock:
-            for k in self._controls:
-                v = self.__dict__[k]
-                dict_[k] = v
+        for k in self._controls:
+            v = self.__dict__[k]
+            dict_[k] = v
         return dict_

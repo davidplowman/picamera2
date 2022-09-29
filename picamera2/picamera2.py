@@ -189,6 +189,7 @@ class Picamera2:
         self.post_callback = None
         self.completed_requests = []
         self.lock = threading.Lock()  # protects the functions and completed_requests fields
+        self.controls_lock = threading.Lock()  # protects controls and requests
         self.have_event_loop = False
         self.camera_properties_ = {}
         self.controls = Controls(self)
@@ -945,7 +946,8 @@ class Picamera2:
 
     def set_controls(self, controls) -> None:
         """Set camera controls. These will be delivered with the next request that gets submitted."""
-        self.controls.set_controls(controls)
+        with self.controls_lock:
+            self.controls._set_controls(controls)
 
     def _get_completed_requests(self) -> List[CompletedRequest]:
         # Return all the requests that libcamera has completed.
