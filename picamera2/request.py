@@ -99,6 +99,14 @@ class CompletedRequest:
         self.stop_count = picam2.stop_count
         self.configure_count = picam2.configure_count
 
+    @property
+    def submit_id(self):
+        return self.request.submit_id
+
+    @property
+    def sync_id(self):
+        return self.request.sync_id
+
     def acquire(self):
         """Acquire a reference to this completed request, which stops it being recycled back to
         the camera system.
@@ -126,6 +134,7 @@ class CompletedRequest:
                         self.request.set_control(id, value)
                     self.picam2.controls = Controls(self.picam2)
                     self.picam2.camera.queue_request(self.request)
+                    self.picam2._submit_id = self.request.submit_id
                 self.request = None
 
     def make_buffer(self, name):

@@ -190,6 +190,7 @@ class Picamera2:
         self.completed_requests = []
         self.lock = threading.Lock()  # protects the functions and completed_requests fields
         self.controls_lock = threading.Lock()  # protects controls and requests
+        self._submit_id = 0  # the submit id of the last queued request
         self.have_event_loop = False
         self.camera_properties_ = {}
         self.controls = Controls(self)
@@ -948,6 +949,7 @@ class Picamera2:
         """Set camera controls. These will be delivered with the next request that gets submitted."""
         with self.controls_lock:
             self.controls._set_controls(controls)
+            return self._submit_id + 1 if self.started else 0
 
     def _get_completed_requests(self) -> List[CompletedRequest]:
         # Return all the requests that libcamera has completed.
@@ -1129,15 +1131,20 @@ class Picamera2:
         if wait:
             return self.wait()
 
-    def capture_request_(self):
+    def capture_request_(self, sync_id=0):
         # The "use" of this request is transferred from the completed_requests list to the caller.
-        return (True, self.completed_requests.pop(0))
+        completed_request = self.completed_requests.pop(0)
+        if completed_request.sync_id >= sync_id:
+            return (True, completed_request)
+        else:
+            completed_request.release()
+            return (False, None)
 
-    def capture_request(self, wait=None, signal_function=None):
+    def capture_request(self, wait=None, signal_function=None, sync_id=0):
         """Fetch the next completed request from the camera system. You will be holding a
         reference to this request so you must release it again to return it to the camera system.
         """
-        function = self.capture_request_
+        function = partial(self.capture_request_, sync_id)
         return self._execute_or_dispatch(function, wait, signal_function)
 
     def switch_mode_capture_request_and_stop(self, camera_config, wait=None, signal_function=None):
