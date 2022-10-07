@@ -1332,6 +1332,54 @@ class Picamera2:
         if wait:
             return self.wait()
 
+    def capture_sequence(self, controls_list, callback):
+        """Capture a sequence of images where each corresponds to a set of controls
+        from the controls_list. Each set of controls in the list is applied in turn,
+        and when that set of controls has taken effect the callback will be invoked
+        with the index into the list of the set of controls that now applies, and
+        the request that fulfills them.
+
+        Note that controls are not guaranteed to be applied in the order they have
+        in the controls_list. Mostly this does happen, but real-time behaviours make
+        it difficult to guarantee. So the callback function might find that it
+        "skips" an index value, but that this value will then appear later.
+
+        This function works by cycling round the sets of controls in the list over
+        and over, and stops once it's successfully received a request that fulfills
+        each one. This means that once it returns, there will still be some cycling
+        round of controls in the camera pipeline yet to come out. It returns the id
+        of the final set of controls that it wrote, so the caller can wait for that
+        if they want.
+
+        :param controls_list: A list of controls dictionaries, required
+        :type controls_list: list
+        :param callback: A callback function taking an integer and a CompletedRequest
+        :type callback: function
+        """
+        # This is a list of the indices into controls_list that we haven't seen yet
+        ctrl_ids_remaining = list(range(len(controls_list)))
+        # This links the submit ids of the controls we send with their list indices
+        sync_id_queue = []
+        while ctrl_ids_remaining:
+            request = self.capture_request()
+            # This just removes anything from the sync_id_queue that has "expired"
+            while sync_id_queue and sync_id_queue[0]["sync_id"] < request.sync_id:
+                sync_id_queue.pop(0)
+            # Now check if this request is one we're still waiting for.
+            if sync_id_queue and request.sync_id >= sync_id_queue[0]["sync_id"]:
+                ctrl_id = sync_id_queue.pop(0)["ctrl_id"]
+                if ctrl_id in ctrl_ids_remaining:
+                    ctrl_ids_remaining.remove(ctrl_id)
+                    callback(ctrl_id, request)
+            # If we haven't got everything yet, cycle through all the sets of controls
+            # that we haven't seen, sending them again.
+            if ctrl_ids_remaining:
+                sync_id = self.set_controls(controls_list[ctrl_ids_remaining[0]])
+                sync_id_queue.append({"sync_id": sync_id, "ctrl_id": ctrl_ids_remaining[0]})
+                ctrl_ids_remaining.append(ctrl_ids_remaining.pop(0))
+            request.release()
+        return sync_id_queue[-1]["sync_id"]
+
     def start_encoder(self, encoder=None, quality=Quality.MEDIUM) -> None:
         """Start encoder
 
