@@ -250,6 +250,7 @@ class Picamera2:
         finally:
             if tuning_file is not None:
                 tuning_file.close()  # delete the temporary file
+        self._sequence_capture = None
 
     @property
     def camera_manager(self):
@@ -1470,6 +1471,144 @@ class Picamera2:
         functions = [partial(self.switch_mode_, camera_config),
                      partial(capture_image_and_switch_back_, self, preview_config, name)]
         return self.dispatch_functions(functions, wait, signal_function, immediate=True)
+
+    class SequenceCapture:
+        pass
+
+    def capture_sequence_start(self, controls_list, signal_function=None):
+        """Start a sequence capture, where a frame is captured for each set of controls in a list.
+
+        When not running in UI event loop, you should probably use capture_sequence() instead.
+        This function starts the sequence capture process. When you are signalled that the
+        first frame has been captured, pass this job to the capture_sequence_process() function.
+
+        The controls_list is a list of dictionaries, each dictionary being a set of controls for
+        which you wish to capture a frame.
+        """
+        if self._sequence_capture is not None:
+            raise RuntimeError("Sequence capture already running")
+        seq_capture = Picamera2.SequenceCapture()
+        self._sequence_capture = seq_capture
+        seq_capture.controls_list = controls_list
+        seq_capture.sync_id_queue = []
+        seq_capture.ctrl_ids_remaining = list(range(len(controls_list)))
+        seq_capture.signal_function = signal_function
+        seq_capture.job = self.capture_request(wait=False, signal_function=signal_function)
+        return seq_capture.job
+
+    def capture_sequence_process(self, job):
+        """Handle a sequence capture notification.
+
+        Call this function every time you are notified of a job being complete that is part of
+        sequence capture. Pass it the job that has just completed. This function is provided
+        principally for applications running in the event loop of a UI.
+
+        The function returns a pair of values. The first value is an index into the controls_list
+        passed to capture_sequence_start() that corresponds to this frame, or the value None if
+        the frame does not correspond to any of the sets of controls that you are still waiting for.
+        The second value is always the request which has just been captured.
+
+        After calling this function, always call capture_sequence_continue() with this request.
+        """
+        if self._sequence_capture is None:
+            raise RuntimeError("Sequence capture not running")
+        seq_capture = self._sequence_capture
+        if job != seq_capture.job:
+            raise RuntimeError("Unexpected job in sequence capture")
+        request = job.get_result()
+
+        # This just removes anything from the sync_id_queue that has "expired"
+        while seq_capture.sync_id_queue and seq_capture.sync_id_queue[0]["sync_id"] < request.sync_id:
+            seq_capture.sync_id_queue.pop(0)
+
+        # Now check if this request is one we're still waiting for.
+        if seq_capture.sync_id_queue and request.sync_id >= seq_capture.sync_id_queue[0]["sync_id"]:
+            ctrl_id = seq_capture.sync_id_queue.pop(0)["ctrl_id"]
+            if ctrl_id in seq_capture.ctrl_ids_remaining:
+                # Note that we've seen this one now, and hand it out to the caller.
+                seq_capture.ctrl_ids_remaining.remove(ctrl_id)
+                return (ctrl_id, request)
+
+        # Request was not one we are still waiting for.
+        return (None, request)
+
+    def capture_sequence_continue(self, request):
+        """Handle a request returned by the capture_sequence_process() function.
+
+        Call this function every time you have finished with the request returned by
+        capture_sequence_process(). The request will be released back to the camera system.
+        This function will return None if all the frames have been received and there are no
+        more captures required, otherwise it will return the next job that will be signalled.
+
+        After calling this function, the application should wait for the next job to be signalled
+        as finished if there was one (and then call capture_sequence_process() again), otherwise it
+        should call capure_sequence_end() if None was returned.
+        """
+        if self._sequence_capture is None:
+            raise RuntimeError("Sequence capture not running")
+        seq_capture = self._sequence_capture
+
+        # Re-send the least recently sent controls.
+        if seq_capture.ctrl_ids_remaining:
+            sync_id = self.set_controls(seq_capture.controls_list[seq_capture.ctrl_ids_remaining[0]])
+            seq_capture.sync_id_queue.append({"sync_id": sync_id, "ctrl_id": seq_capture.ctrl_ids_remaining[0]})
+            seq_capture.ctrl_ids_remaining.append(seq_capture.ctrl_ids_remaining.pop(0))
+        request.release()
+
+        # If there are still controls we haven't seen, then we'll need another frame.
+        if seq_capture.ctrl_ids_remaining:
+            seq_capture.job = self.capture_request(wait=False, signal_function=seq_capture.signal_function)
+        else:
+            seq_capture.job = None
+        return seq_capture.job
+
+    def capture_sequence_end(self):
+        """Call this function to end the processing of a capture sequence.
+
+        This function should be called once capture_sequence_continue() returns None. Subsequently,
+        another capture sequence may be started using capture_sequence_start().
+        """
+        if self._sequence_capture is None:
+            raise RuntimeError("Sequence capture not running")
+        seq_capture = self._sequence_capture
+        self._sequence_capture = None
+        # There are still control changes queued up, so return the sync_id of the last
+        # one, in case the application wants to wait.
+        return seq_capture.sync_id_queue[-1]["sync_id"]
+
+    def capture_sequence(self, controls_list, callback):
+        """Capture a sequence of images with different control settings.
+
+        Capture a sequence of images where each corresponds to a set of controls
+        from the controls_list. Each set of controls in the list is applied in turn,
+        and when that set of controls has taken effect the callback will be invoked
+        with the index into the list of the set of controls that now applies, and
+        the request that fulfills them.
+
+        Note that controls are not guaranteed to be applied in the order they have
+        in the controls_list. Mostly this does happen, but real-time behaviours make
+        it difficult to guarantee. So the callback function might find that it
+        "skips" an index value, but that this value will then appear later.
+
+        This function works by cycling round the sets of controls in the list over
+        and over, and stops once it's successfully received a request that fulfills
+        each one. This means that once it returns, there will still be some cycling
+        round of controls in the camera pipeline yet to come out. It returns the id
+        of the final set of controls that it wrote, so the caller can wait for that
+        if they want.
+
+        :param controls_list: A list of controls dictionaries, required
+        :type controls_list: list
+        :param callback: A callback function taking an integer and a CompletedRequest
+        :type callback: function
+        """
+        job = self.capture_sequence_start(controls_list)
+        while job is not None:
+            ctrl_id, request = self.capture_sequence_process(job)
+            if ctrl_id is not None:
+                callback(ctrl_id, request)
+            job = self.capture_sequence_continue(request)
+        return self.capture_sequence_end()
 
     def start_encoder(self, encoder=None, output=None, pts=None, quality=None, name=None) -> None:
         """Start encoder
