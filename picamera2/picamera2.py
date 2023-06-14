@@ -335,6 +335,7 @@ class Picamera2:
         self.completed_requests = []
         self.lock = threading.Lock()  # protects the _job_list and completed_requests fields
         self._controls_lock = threading.Lock()  # protects controls and requests
+        self._submit_id = 0
         self._event_loop_running = False
         self._preview_stopped = threading.Event()
         self.camera_properties_ = {}
@@ -1281,6 +1282,7 @@ class Picamera2:
         """Set camera controls. These will be delivered with the next request that gets submitted."""
         with self._controls_lock:
             self.controls._set_controls(controls)
+            return self._submit_id + 1 if self.started else 0
 
     def process_requests(self, display) -> None:
         # This is the function that the event loop, which runs externally to us, must call.
@@ -1666,11 +1668,16 @@ class Picamera2:
                      partial(capture_and_switch_back_, self, preview_config)]
         return self.dispatch_functions(functions, wait, signal_function, immediate=True)
 
-    def capture_request_(self):
+    def capture_request_(self, sync_id=0):
         # The "use" of this request is transferred from the completed_requests list to the caller.
         if not self.completed_requests:
             return (False, None)
-        return (True, self.completed_requests.pop(0))
+        completed_request = self.completed_requests.pop(0)
+        if completed_request.sync_id >= sync_id:
+            return (True, completed_request)
+        else:
+            completed_request.release()
+            return (False, None)
 
     @overload
     def capture_request(self, wait: None = ...,
@@ -1696,7 +1703,8 @@ class Picamera2:
                         ) -> Job[CompletedRequest]:
         ...
 
-    def capture_request(self, wait=None, signal_function=None, flush=None) -> Union[CompletedRequest, Job[CompletedRequest]]:
+    def capture_request(self, wait=None, signal_function=None, flush=None, sync_id=0
+                        ) -> Union[CompletedRequest, Job[CompletedRequest]]:
         """Fetch the next completed request from the camera system.
 
         You will be holding a reference to this request so you must release it again to return it
@@ -1706,7 +1714,7 @@ class Picamera2:
         if flush is True:
             flush = time.monotonic_ns()
         functions = [partial(self.wait_for_timestamp_, flush),
-                     self.capture_request_]
+                     partial(self.capture_request_, sync_id)]
         return self.dispatch_functions(functions, wait, signal_function)
 
     @overload

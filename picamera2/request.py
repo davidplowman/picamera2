@@ -97,6 +97,14 @@ class CompletedRequest:
             self.picam2.allocator.acquire(self.request.buffers)
             [sync.__enter__() for sync in self.syncs]
 
+    @property
+    def submit_id(self) -> int:
+        return self.request.submit_id
+
+    @property
+    def sync_id(self) -> int:
+        return self.request.sync_id
+
     def acquire(self) -> None:
         """Acquire a reference to this completed request, which stops it being recycled back to the camera system."""
         with self._controls_lock:
@@ -139,6 +147,7 @@ class CompletedRequest:
 
                     self.picam2.controls = Controls(self.picam2)
                     self.picam2.camera.queue_request(self.request)
+                    self.picam2._submit_id = self.request.submit_id
                 [sync.__exit__() for sync in self.syncs]
                 assert self.request is not None
                 self.picam2.allocator.release(self.request.buffers)
