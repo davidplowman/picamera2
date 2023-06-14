@@ -84,6 +84,8 @@ class CompletedRequest:
         self.request = request
         self.ref_count: int = 1
         self.lock = picam2.request_lock
+        # Use the Picamera2's global controls lock
+        self._controls_lock = picam2._controls_lock
         self.picam2 = picam2
         self.stop_count: int = picam2.stop_count
         self.configure_count: int = picam2.configure_count
@@ -97,14 +99,14 @@ class CompletedRequest:
 
     def acquire(self) -> None:
         """Acquire a reference to this completed request, which stops it being recycled back to the camera system."""
-        with self.lock:
+        with self._controls_lock:
             if self.ref_count == 0:
                 raise RuntimeError("CompletedRequest: acquiring lock with ref_count 0")
             self.ref_count += 1
 
     def release(self) -> None:
         """Release this completed frame back to the camera system (once its reference count reaches zero)."""
-        with self.lock:
+        with self._controls_lock:
             self.ref_count -= 1
             if self.ref_count < 0:
                 raise RuntimeError("CompletedRequest: lock now has negative ref_count")
