@@ -276,6 +276,7 @@ class Picamera2:
         self.completed_requests: List[CompletedRequest] = []
         self.lock = threading.Lock()  # protects the _job_list and completed_requests fields
         self._controls_lock = threading.Lock()  # protects controls and requests
+        self._submit_id = 0
         self._event_loop_running = False
         self._preview_stopped = threading.Event()
         self.camera_properties_ = {}
@@ -1068,6 +1069,7 @@ class Picamera2:
         """Set camera controls. These will be delivered with the next request that gets submitted."""
         with self._controls_lock:
             self.controls._set_controls(controls)
+            return self._submit_id + 1 if self.started else 0
 
     def process_requests(self, display) -> None:
         # This is the function that the event loop, which runs externally to us, must
@@ -1256,19 +1258,24 @@ class Picamera2:
                      partial(capture_and_switch_back_, self, preview_config)]
         return self.dispatch_functions(functions, wait, signal_function, immediate=True)
 
-    def capture_request_(self):
+    def capture_request_(self, sync_id=0):
         # The "use" of this request is transferred from the completed_requests list to the caller.
         if not self.completed_requests:
             return (False, None)
-        return (True, self.completed_requests.pop(0))
+        completed_request = self.completed_requests.pop(0)
+        if completed_request.sync_id >= sync_id:
+            return (True, completed_request)
+        else:
+            completed_request.release()
+            return (False, None)
 
-    def capture_request(self, wait=None, signal_function=None):
+    def capture_request(self, wait=None, signal_function=None, sync_id=0):
         """Fetch the next completed request from the camera system.
 
         You will be holding a reference to this request so you must release it again to return it
         to the camera system.
         """
-        functions = [self.capture_request_]
+        functions = [partial(self.capture_request_, sync_id)]
         return self.dispatch_functions(functions, wait, signal_function)
 
     def switch_mode_capture_request_and_stop(self, camera_config, wait=None, signal_function=None):

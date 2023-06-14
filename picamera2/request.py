@@ -113,6 +113,14 @@ class CompletedRequest:
         self.config = self.picam2.camera_config.copy()
         self.stream_map = self.picam2.stream_map.copy()
 
+    @property
+    def submit_id(self):
+        return self.request.submit_id
+
+    @property
+    def sync_id(self):
+        return self.request.sync_id
+
     def acquire(self):
         """Acquire a reference to this completed request, which stops it being recycled back to the camera system."""
         with self._controls_lock:
@@ -136,6 +144,7 @@ class CompletedRequest:
                         self.request.set_control(id, value)
                     self.picam2.controls = Controls(self.picam2)
                     self.picam2.camera.queue_request(self.request)
+                    self.picam2._submit_id = self.request.submit_id
                 self.request = None
                 self.config = None
                 self.stream_map = None
