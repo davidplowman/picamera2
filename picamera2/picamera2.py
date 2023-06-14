@@ -275,6 +275,7 @@ class Picamera2:
         self.post_callback = None
         self.completed_requests: List[CompletedRequest] = []
         self.lock = threading.Lock()  # protects the _job_list and completed_requests fields
+        self._controls_lock = threading.Lock()  # protects controls and requests
         self._event_loop_running = False
         self._preview_stopped = threading.Event()
         self.camera_properties_ = {}
@@ -1065,7 +1066,8 @@ class Picamera2:
 
     def set_controls(self, controls) -> None:
         """Set camera controls. These will be delivered with the next request that gets submitted."""
-        self.controls.set_controls(controls)
+        with self._controls_lock:
+            self.controls._set_controls(controls)
 
     def process_requests(self, display) -> None:
         # This is the function that the event loop, which runs externally to us, must
