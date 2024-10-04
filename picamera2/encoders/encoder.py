@@ -40,6 +40,8 @@ class Encoder:
         self.firsttimestamp = None
         self.frame_skip_count = 1
         self._skip_count = 0
+        self.sync_enable = False
+        self.sync = threading.Event()
 
     @property
     def running(self):
@@ -208,6 +210,16 @@ class Encoder:
         :param request: Request
         :type request: request
         """
+        # If "sync" has been requested, we must wait for the image metadata to say that we
+        # don't need to wait any more. While waiting, we simply don't encode any frames.
+        if self.sync_enable:
+            metadata = request.get_metadata()
+            if metadata.get('SyncWait', True):
+                return
+            else:
+                self.sync_enable = False
+                self.sync.set()
+
         if self._skip_count == 0:
             with self._lock:
                 self._encode(stream, request)
