@@ -33,6 +33,10 @@ class PyavOutput(Output):
         # The output container that does the muxing needs to know about the streams for which packets
         # will be sent to it. It literally needs to copy them for the output container.
         stream = self._container.add_stream(codec_name, **kwargs)
+        if stream.type == 'video':
+            stream.time_base = Fraction(1, 1000000)
+        elif stream.type == 'audio' and encoder_stream.time_base:
+            stream.time_base = encoder_stream.time_base
 
         if codec_name == "mjpeg":
             # Well, this is nasty. MJPEG seems to need this.
@@ -74,7 +78,10 @@ class PyavOutput(Output):
                 new_packet = av.Packet(packet)
                 if packet.stream not in self._streams:
                     raise RuntimeError("Stream not found in PyavOutput")
-                new_packet.stream = self._streams[packet.stream]
+                new_stream = self._streams[packet.stream]
+                if packet.stream.time_base:
+                    new_stream.time_base = packet.stream.time_base
+                new_packet.stream = new_stream
                 new_packet.dts = timestamp
                 new_packet.pts = timestamp
                 new_packet.time_base = Fraction(1, 1000000)

@@ -291,6 +291,8 @@ class Encoder:
                 self._audio_input_stream = self._audio_input_container.streams.get(audio=0)[0]
                 self._audio_output_container = av.open("/dev/null", 'w', format="null")
                 self._audio_output_stream = self._audio_output_container.add_stream(**self.audio_output)
+                if not self._audio_output_stream.time_base:
+                    self._audio_output_stream.time_base = Fraction(1, self._audio_output_stream.rate)
                 # Outputs that can handle audio need to be told about its existence.
                 for out in self._output:
                     out._add_stream(self._audio_output_stream, **self.audio_output)
