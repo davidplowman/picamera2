@@ -41,6 +41,7 @@ STILL = libcamera.StreamRole.StillCapture
 RAW = libcamera.StreamRole.Raw
 VIDEO = libcamera.StreamRole.VideoRecording
 VIEWFINDER = libcamera.StreamRole.Viewfinder
+RAWINPUT = libcamera.StreamRole.RawInput
 
 T = TypeVar("T")
 _log = logging.getLogger(__name__)
@@ -308,7 +309,7 @@ class Picamera2:
         # Sort alphabetically so they are deterministic, but send USB cams to the back of the class.
         return sorted(cameras, key=lambda cam: ("/usb" not in cam['Id'], cam['Id']), reverse=True)
 
-    def __init__(self, camera_num=0, verbose_console=None, tuning=None, allocator=None):
+    def __init__(self, camera_num=None, verbose_console=None, tuning=None, allocator=None, memory_cam=None):
         """Initialise camera system and open the camera for use.
 
         :param camera_num: Camera index, defaults to 0
@@ -319,17 +320,32 @@ class Picamera2:
         :type tuning: str, optional
         :raises RuntimeError: Init didn't complete
         """
+        if not memory_cam:
+            camera_num = 0
+        elif not tuning:
+            raise ValueError("Must specify a camera tuning for a memory camera")
+        if camera_num is not None and memory_cam is not None:
+            raise ValueError("Cannot specify both camera_num and memory_cam")
         if verbose_console is not None:
             _log.warning("verbose_console parameter is no longer used, use Picamera2.set_logging instead")
         tuning_file = None
+        tuning_file_name = None
         if tuning is not None:
             if isinstance(tuning, str):
-                os.environ["LIBCAMERA_RPI_TUNING_FILE"] = tuning
+                # Memory cams get passed the tuning file name, it does come through the environment variable
+                if memory_cam:
+                    tuning_file_name = tuning
+                else:
+                    os.environ["LIBCAMERA_RPI_TUNING_FILE"] = tuning
             else:
                 tuning_file = tempfile.NamedTemporaryFile('w')
                 json.dump(tuning, tuning_file)
                 tuning_file.flush()  # but leave it open as closing it will delete it
-                os.environ["LIBCAMERA_RPI_TUNING_FILE"] = tuning_file.name
+                # Again, memory cams take the tuning file name directly
+                if memory_cam:
+                    tuning_file_name = tuning_file.name
+                else:
+                    os.environ["LIBCAMERA_RPI_TUNING_FILE"] = tuning_file.name
         else:
             os.environ.pop("LIBCAMERA_RPI_TUNING_FILE", None)  # Use default tuning
         self.notifyme_r, self.notifyme_w = os.pipe2(os.O_NONBLOCK)
@@ -337,29 +353,38 @@ class Picamera2:
         # Set these before trying to open the camera in case that fails (shutting stuff down may check them).
         self._preview = None
         self.is_open = False
-        # Get the real libcamera internal number.
-        camera_num = self.global_camera_info()[camera_num]['Num']
-        self._cm.add(camera_num, self)
-        self.camera_idx = camera_num
+        self.memory_cam = memory_cam
+        self._memory_cam_spec = (memory_cam, tuning_file_name)
+        if memory_cam:
+            # For now, just one "memory camera" and it's going to be magic number 999.
+            self.camera_idx = 999
+        else:
+            # Get the real libcamera internal number.
+            self.camera_idx = self.global_camera_info()[camera_num]['Num']
+        self._cm.add(self.camera_idx, self)
         self.request_lock = threading.Lock()  # global lock used by requests
         self._requestslock = threading.Lock()
         self._requests = []
+        self._reprocess_requests = []
         if verbose_console is None:
             verbose_console = int(os.environ.get('PICAMERA2_LOG_LEVEL', '0'))
         self.verbose_console = verbose_console
         self._reset_flags()
         self.helpers = Helpers(self)
         try:
-            self._open_camera()
+            # tuning_file_name only does anything for memory cams
+            self._open_camera(tuning_file_name)
             _log.debug(f"{self.camera_manager}")
             # We deliberately make raw streams with no size so that it will be filled in
             # later once the main stream size has been set.
-            self.preview_configuration_ = CameraConfiguration(self.create_preview_configuration(), self)
-            self.preview_configuration_.enable_raw()  # causes the size to be reset to None
-            self.still_configuration_ = CameraConfiguration(self.create_still_configuration(), self)
-            self.still_configuration_.enable_raw()  # ditto
-            self.video_configuration_ = CameraConfiguration(self.create_video_configuration(), self)
-            self.video_configuration_.enable_raw()  # ditto
+            if not memory_cam:
+                # These configurations are not valid for memory cams.
+                self.preview_configuration_ = CameraConfiguration(self.create_preview_configuration(), self)
+                self.preview_configuration_.enable_raw()  # causes the size to be reset to None
+                self.still_configuration_ = CameraConfiguration(self.create_still_configuration(), self)
+                self.still_configuration_.enable_raw()  # ditto
+                self.video_configuration_ = CameraConfiguration(self.create_video_configuration(), self)
+                self.video_configuration_.enable_raw()  # ditto
         except Exception:
             _log.error("Camera __init__ sequence did not complete.")
             raise RuntimeError("Camera __init__ sequence did not complete.")
@@ -551,13 +576,20 @@ class Picamera2:
                 self.camera_idx = idx
                 break
 
-    def _open_camera(self):
+    def _open_camera(self, tuning_file_name=None):
         """Tries to open camera
+
+        Only memory cameras pass a tuning file name, as it would be ignored for real cams.
 
         :raises RuntimeError: Failed to setup camera
         """
         try:
-            self._initialize_camera()
+            if not self.memory_cam:
+                self._initialize_camera()
+            else:
+                self.camera = self._cm.cms.get_memory_camera(self.memory_cam, tuning_file_name)
+                # Various properties e.g. sensor resolution, aren't known until we get configured,
+                # so we leave those blank for now.
         except RuntimeError:
             raise RuntimeError("Failed to initialize camera")
 
@@ -871,6 +903,45 @@ class Picamera2:
         self._add_display_and_encode(config, display, encode)
         return config
 
+    def create_reprocessing_configuration(self, main={}, lores=None, raw={}, transform=libcamera.Transform(),
+                                          colour_space=None, buffer_count=1, controls={}, display="main",
+                                          encode="main", queue=True, sensor={}, use_case="reprocessing") -> dict[str, Any]:
+        """Make a configuration for Bayer reprocessing."""
+        if self.camera is None:
+            raise RuntimeError("Camera not opened")
+        if not self.memory_cam:
+            raise RuntimeError("Bayer reprocessing only available with memory cameras")
+        if not raw:
+            raise ValueError("Bayer reprocessing must specify the raw stream format")
+        if 'size' not in raw:
+            raise ValueError("Raw configuration for Bayer reprocessing must specify size")
+        if 'format' not in raw:
+            raise ValueError("Raw configuration for Bayer reprocessing must specify format")
+
+        main = self._make_initial_stream_config({'format': 'XBGR8888', 'size': raw['size'], 'preserve_ar': True}, main)
+        self.align_stream(main, optimal=False)
+        lores = self._make_initial_stream_config({'format': 'YUV420', 'size': raw['size'], 'preserve_ar': False}, lores)
+        if lores is not None:
+            self.align_stream(lores, optimal=False)
+        raw = self._make_initial_stream_config({'format': raw['format'], 'size': raw['size']},
+                                               raw, self._raw_stream_ignore_list)
+
+        if colour_space is None:
+            colour_space = libcamera.ColorSpace.Rec709()
+
+        config = {"use_case": use_case,
+                  "transform": transform,
+                  "colour_space": colour_space,
+                  "buffer_count": buffer_count,
+                  "queue": queue,
+                  "main": main,
+                  "lores": lores,
+                  "raw": raw,
+                  "controls": controls,
+                  "sensor": sensor}
+        self._add_display_and_encode(config, display, encode)
+        return config
+
     def check_stream_config(self, stream_config, name) -> None:
         """Check the configuration of the passed in config.
 
@@ -957,7 +1028,10 @@ class Picamera2:
             roles += [VIEWFINDER]
         if camera_config["raw"] is not None:
             self.raw_index = index
-            roles += [RAW]
+            if self.memory_cam:
+                roles += [RAWINPUT]
+            else:
+                roles += [RAW]
 
         # Make the libcamera configuration, and then we'll write all our parameters over the ones it gave us.
         libcamera_config = self.camera.generate_configuration(roles)
@@ -975,7 +1049,7 @@ class Picamera2:
             self._update_libcamera_stream_config(libcamera_config.at(self.raw_index), camera_config["raw"], buffer_count)
             libcamera_config.at(self.raw_index).color_space = libcamera.ColorSpace.Raw()
 
-        if not self._is_rpi_camera():
+        if not self._is_rpi_camera() and not self.memory_cam:
             return libcamera_config
 
         # We're always going to set up the sensor config fully.
@@ -1053,8 +1127,9 @@ class Picamera2:
         """
         num_requests = min([len(self.allocator.buffers(stream)) for stream in self.streams])
         requests = []
+        cookie = self.camera_idx
         for i in range(num_requests):
-            request = self.camera.create_request(self.camera_idx)
+            request = self.camera.create_request(cookie)
             if request is None:
                 raise RuntimeError("Could not create request")
 
@@ -1107,6 +1182,8 @@ class Picamera2:
         initial_config = camera_config
 
         if isinstance(camera_config, str):
+            if self.memory_cam:
+                raise ValueError("An explicit configuration must be provided for Bayer reprocessing")
             if camera_config == "preview":
                 camera_config = self.preview_configuration
             elif camera_config == "still":
@@ -1124,7 +1201,20 @@ class Picamera2:
         else:
             raise TypeError("Invalid type for `camera_config` given")
 
-        # For unset raw streams, patch up the format/size.
+        # Memory cameras for reprocessing must provide a raw size and format. It's only at this
+        # point that we can claim a "sensor" format and resolution.
+        if self.memory_cam:
+            if camera_config['raw'] is None:
+                raise ValueError("Raw stream required for Bayer reprocessing")
+            if camera_config['raw'].get('format') is None:
+                raise ValueError("Raw stream format is required for Bayer reprocessing")
+            if camera_config['raw'].get('size') is None:
+                raise ValueError("Raw stream size is required for Bayer reprocessing")
+            self.sensor_format = camera_config['raw']['format']
+            self.sensor_resolution = camera_config['raw']['size']
+            self._raw_modes = [camera_config['raw']]
+
+        # for unset raw streams, patch up the format/size.
         if camera_config["raw"] is not None:
             if camera_config["raw"]["format"] is None:
                 camera_config["raw"]["format"] = self.sensor_format
@@ -1132,7 +1222,7 @@ class Picamera2:
                 camera_config["raw"]["size"] = camera_config["main"]["size"]
 
         # Be 100% sure that non-Pi cameras aren't asking for a raw stream.
-        if not self._is_rpi_camera():
+        if not self._is_rpi_camera() and not self.memory_cam:
             camera_config['raw'] = None
 
         # Mark ourselves as unconfigured.
@@ -1250,8 +1340,14 @@ class Picamera2:
         self.controls = Controls(self)
         # camera.start() now throws an error if it fails.
         self.camera.start(controls)
-        for request in self._make_requests():
-            self.camera.queue_request(request)
+        requests = self._make_requests()
+        # For memory cams, the user has to fill requests before pushing them to the ISP.
+        # For ordinary cams, just queue the requests as they will be returned spontaneously.
+        if self.memory_cam:
+            self._reprocess_requests = requests
+        else:
+            for request in requests:
+                self.camera.queue_request(request)
         _log.info("Camera started")
         self.started = True
 
@@ -1336,6 +1432,24 @@ class Picamera2:
         else:
             self.stop_()
 
+    def get_reprocessing_request(self) -> CompletedRequest:
+        """Get a request object that we can use for reprocessing."""
+        with self.request_lock:
+            request = self._reprocess_requests[0]
+            self._reprocess_requests = self._reprocess_requests[1:]
+        request.reuse()
+        completed_request = CompletedRequest(request, self)
+        completed_request._memory_cam_queue_to_camera = True
+        return completed_request
+
+    @contextlib.contextmanager
+    def reprocessing_request(self):
+        request = self.get_reprocessing_request()
+        try:
+            yield request
+        finally:
+            request.release()
+
     def set_controls(self, controls) -> None:
         """Set camera controls. These will be delivered with the next request that gets submitted."""
         self.controls.set_controls(controls)
@@ -1348,11 +1462,14 @@ class Picamera2:
             self._requests = []
         # Discard "startup frames", or frames with errors etc.
         requests = []
-        for req in new_requests:
-            if next(iter(req.request.buffers.values())).metadata.status == libcamera.FrameMetadata.Status.Success:
-                requests.append(req)
-            else:
-                req.release()
+        if self.memory_cam:
+            requests = new_requests
+        else:
+            for req in new_requests:
+                if next(iter(req.request.buffers.values())).metadata.status == libcamera.FrameMetadata.Status.Success:
+                    requests.append(req)
+                else:
+                    req.release()
         self.frames += len(requests)
         # It works like this:
         # * We maintain a list of the requests that libcamera has completed (completed_requests).
@@ -1406,9 +1523,11 @@ class Picamera2:
 
                 req.release()
 
-            # We hang on to the last completed request if we have been asked to.
-            while len(self.completed_requests) > self._max_queue_len:
-                self.completed_requests.pop(0).release()
+            # We hang on to the last completed request if we have been asked to. For memory cams,
+            # we always hang on to requests so that the user gets them all back.
+            if not self.memory_cam:
+                while len(self.completed_requests) > self._max_queue_len:
+                    self.completed_requests.pop(0).release()
 
         # If one of the functions we ran reconfigured the camera since this request came out,
         # then we don't want it going back to the application as the memory is not valid.

@@ -96,6 +96,7 @@ class CompletedRequest:
         self.configure_count: int = picam2.configure_count
         self.config = self.picam2.camera_config.copy()
         self.stream_map = self.picam2.stream_map.copy()
+        self._memory_cam_queue_to_camera = False
         with self.lock:
             self.syncs = [picam2.allocator.sync(self.picam2.allocator, buffer, False)
                           for buffer in self.request.buffers.values()]
@@ -120,7 +121,8 @@ class CompletedRequest:
                 # can't recycle it.
                 if self.picam2.camera and self.stop_count == self.picam2.stop_count and self.picam2.started:
                     assert self.request is not None
-                    self.request.reuse()
+                    if not self.picam2.memory_cam:
+                        self.request.reuse()
                     controls = self.picam2.controls.get_libcamera_controls()
                     for id, value in controls.items():
 
@@ -143,13 +145,32 @@ class CompletedRequest:
                         self.request.set_control(id, value)
 
                     self.picam2.controls = Controls(self.picam2)
-                    self.picam2.camera.queue_request(self.request)
+                    if self.picam2.memory_cam:
+                        # When the user releases a reprocessing request which they have filled in,
+                        # then it gets sent to the camera for reprocessing. But when it emerges,
+                        # and gets released again, it goes back on the reprocess requests queue for
+                        # when the user next wants to use it.
+                        if self._memory_cam_queue_to_camera:
+                            self.picam2.camera.queue_request(self.request)
+                        else:
+                            self.picam2._reprocess_requests.append(self.request)
+                    else:
+                        self.picam2.camera.queue_request(self.request)
                 [sync.__exit__() for sync in self.syncs]
                 assert self.request is not None
                 self.picam2.allocator.release(self.request.buffers)
                 self.request = None
                 self.config = {}
                 self.stream_map = {}
+
+    def set_controls(self, controls: Dict) -> None:
+        """Set controls in a reprocessing request."""
+        if not self.picam2.memory_cam:
+            raise RuntimeError("Cannot set controls on non-memory cam request")
+        # For memory cams, don't invent ExposureTimeMode or AnalogueGainMode controls,
+        # because there wil be no AGC algorithm so it will just complain.
+        for id, value in Controls(self.picam2, controls).get_libcamera_controls().items():
+            self.request.set_control(id, value)
 
     def make_buffer(self, name: str) -> np.ndarray:
         """Make a 1D numpy array from the named stream's buffer."""
@@ -433,7 +454,7 @@ class Helpers:
         img.save(file_output, **keywords)
         end_time = time.monotonic()
         _log.info(f"Saved {self} to file {file_output}.")
-        _log.info(f"Time taken for encode: {(end_time-start_time)*1000} ms.")
+        _log.info(f"Time taken for encode: {(end_time - start_time) * 1000} ms.")
 
     def save_dng(self, buffer: np.ndarray, metadata: Dict[str, Any], config: Dict[str, Any], file_output: Any) -> None:
         """Save a DNG RAW image of the raw stream's buffer."""
@@ -464,7 +485,7 @@ class Helpers:
 
         end_time = time.monotonic()
         _log.info(f"Saved {self} to file {file_output}.")
-        _log.info(f"Time taken for encode: {(end_time-start_time)*1000} ms.")
+        _log.info(f"Time taken for encode: {(end_time - start_time) * 1000} ms.")
 
     def decompress(self, array: np.ndarray):
         """Decompress an image buffer that has been compressed with a PiSP compression format."""
