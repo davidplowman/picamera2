@@ -1857,31 +1857,39 @@ class Picamera2:
         ]
         return self.dispatch_functions(functions, wait, signal_function, immediate=True)
 
-    def capture_request_(self):
+    def capture_request_(self, control_id):
         # The "use" of this request is transferred from the completed_requests list to the caller.
         if not self.completed_requests:
             return (False, None)
-        return (True, self.completed_requests.pop(0))
-
-    @overload
-    def capture_request(self, wait: None = ..., signal_function: None = ..., flush=None) -> CompletedRequest: ...
-
-    @overload
-    def capture_request(
-        self, wait: None = ..., signal_function: Callable[[Job], None] = ..., flush=None
-    ) -> Job[CompletedRequest]: ...
+        completed_request = self.completed_requests.pop(0)
+        if control_id is None or completed_request.get_metadata()['ControlListSequence'] >= control_id:
+            return (True, completed_request)
+        completed_request.release()
+        return (False, None)
 
     @overload
     def capture_request(
-        self, wait: Literal[True] = ..., signal_function: Optional[Callable[[Job], None]] = ..., flush=None
+        self, wait: None = ..., signal_function: None = ..., flush=None, control_id=None
     ) -> CompletedRequest: ...
 
     @overload
     def capture_request(
-        self, wait: Literal[False] = ..., signal_function: Optional[Callable[[Job], None]] = ..., flush=None
+        self, wait: None = ..., signal_function: Callable[[Job], None] = ..., flush=None, control_id=None
     ) -> Job[CompletedRequest]: ...
 
-    def capture_request(self, wait=None, signal_function=None, flush=None) -> Union[CompletedRequest, Job[CompletedRequest]]:
+    @overload
+    def capture_request(
+        self, wait: Literal[True] = ..., signal_function: Optional[Callable[[Job], None]] = ..., flush=None, control_id=None
+    ) -> CompletedRequest: ...
+
+    @overload
+    def capture_request(
+        self, wait: Literal[False] = ..., signal_function: Optional[Callable[[Job], None]] = ..., flush=None, control_id=None
+    ) -> Job[CompletedRequest]: ...
+
+    def capture_request(
+        self, wait=None, signal_function=None, flush=None, control_id=None
+    ) -> Union[CompletedRequest, Job[CompletedRequest]]:
         """Fetch the next completed request from the camera system.
 
         You will be holding a reference to this request so you must release it again to return it
@@ -1890,7 +1898,7 @@ class Picamera2:
         # flush will be the timestamp in ns that we wait for (if any)
         if flush is True:
             flush = time.monotonic_ns()
-        functions = [partial(self.wait_for_timestamp_, flush), self.capture_request_]
+        functions = [partial(self.wait_for_timestamp_, flush), partial(self.capture_request_, control_id)]
         return self.dispatch_functions(functions, wait, signal_function)
 
     @overload
@@ -1968,9 +1976,9 @@ class Picamera2:
         return self.dispatch_functions([partial(capture_sync_request_, self)], wait, signal_function)
 
     @contextlib.contextmanager
-    def captured_request(self, wait=None, flush=None):
+    def captured_request(self, wait=None, flush=None, control_id=None):
         """Capture a completed request using the context manager which guarantees its release."""
-        request = self.capture_request(wait=wait, flush=flush)
+        request = self.capture_request(wait=wait, flush=flush, control_id=control_id)
         try:
             yield request
         finally:
