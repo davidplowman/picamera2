@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import threading
 
+import libcamera
 from libcamera import ControlType, Rectangle, Size
 
 
@@ -80,6 +81,17 @@ class Controls:
                         v = Rectangle(*v)
                 elif id.type == ControlType.Size:
                     v = Size(*v)
+                # libcamera now has ExposureTimeMode and AnalogueGainMode which need to
+                # be updated when the exposure/gain is zero (meaning auto mode) or not.
+                # Zero exposures/gains don't need to be sent to libcamera, however.
+                elif id == libcamera.controls.ExposureTime:
+                    libcamera_controls[libcamera.controls.ExposureTimeMode] = 1 if v else 0
+                    if not v:
+                        continue
+                elif id == libcamera.controls.AnalogueGain:
+                    libcamera_controls[libcamera.controls.AnalogueGainMode] = 1 if v else 0
+                    if not v:
+                        continue
                 libcamera_controls[id] = v
         return libcamera_controls
 

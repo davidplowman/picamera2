@@ -161,6 +161,8 @@ class Picamera2:
     platform = Platform.get_platform()
     _cm = CameraManager()
 
+    _controls_id = 0
+
     @classproperty
     def DEBUG(self):
         """Now Deprecated
@@ -1428,6 +1430,12 @@ class Picamera2:
     def set_controls(self, controls) -> None:
         """Set camera controls. These will be delivered with the next request that gets submitted."""
         self.controls.set_controls(controls)
+
+    def queue_controls(self, controls) -> int:
+        self._controls_id += 1
+        controls = Controls(self, controls).get_libcamera_controls()
+        self.camera.queue_controls(controls)
+        return self._controls_id
 
     def process_requests(self, display) -> None:
         # This is the function that the event loop, which runs externally to us, must call.
